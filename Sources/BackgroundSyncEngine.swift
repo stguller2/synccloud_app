@@ -50,23 +50,44 @@ final class BackgroundSyncEngine: ObservableObject {
     private let syncQueue = DispatchQueue(label: "com.synccloud.background", qos: .utility)
     private let googleDrive = GoogleDriveService()
     
-    // Track which files we've already uploaded (persisted with size limit)
-    private static let maxTrackedFiles = 5000
+    // Madde 2: UserDefaults Şişmesini önlemek için dosyada tutuyoruz
+    private var manifestURL: URL {
+        let paths = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        let dir = paths[0].appendingPathComponent("SyncCloud", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("upload_manifest.json")
+    }
     
     private var uploadedFileNames: Set<String> {
         get {
-            Set(UserDefaults.standard.stringArray(forKey: "bgUploadedFiles") ?? [])
+            if let data = try? Data(contentsOf: manifestURL),
+               let array = try? JSONDecoder().decode([String].self, from: data) {
+                return Set(array)
+            }
+            // Geriye dönük uyumluluk: UserDefaults'tan çekmeyi dene
+            if let old = UserDefaults.standard.stringArray(forKey: "bgUploadedFiles") {
+                let set = Set(old)
+                saveManifest(set)
+                UserDefaults.standard.removeObject(forKey: "bgUploadedFiles")
+                return set
+            }
+            return []
         }
         set {
-            // Prevent unbounded growth — keep only the most recent entries
-            var trimmed = newValue
-            if trimmed.count > Self.maxTrackedFiles {
-                let excess = trimmed.count - Self.maxTrackedFiles
-                for _ in 0..<excess {
-                    trimmed.remove(trimmed.first!)
-                }
-            }
-            UserDefaults.standard.set(Array(trimmed), forKey: "bgUploadedFiles")
+            saveManifest(newValue)
+        }
+    }
+    
+    private func saveManifest(_ set: Set<String>) {
+        var trimmed = set
+        if trimmed.count > Self.maxTrackedFiles {
+            let sorted = Array(trimmed).suffix(Self.maxTrackedFiles)
+            trimmed = Set(sorted)
+        }
+        if let data = try? JSONEncoder().encode(Array(trimmed)) {
+            try? data.write(to: manifestURL)
         }
     }
     
@@ -82,8 +103,10 @@ final class BackgroundSyncEngine: ObservableObject {
         }
         lastSyncCount = UserDefaults.standard.integer(forKey: "bgLastSyncCount")
         
-        // Snapshot current photo count
-        let allPhotos = PHAsset.fetchAssets(with: .image, options: nil)
+        // Madde 4: Paylaşılan Kitaplık Desteği (Shared Library)
+        let options = PHFetchOptions()
+        options.includeSharedLibraryContent = true
+        let allPhotos = PHAsset.fetchAssets(with: .image, options: options)
         lastKnownPhotoCount = allPhotos.count
         
         if isEnabled { startMonitoring() }
@@ -166,6 +189,9 @@ final class BackgroundSyncEngine: ObservableObject {
             
             let fetchOptions = PHFetchOptions()
             fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            // Madde 4: Paylaşılan Kitaplık Desteği
+            fetchOptions.includeSharedLibraryContent = true
+            
             let allPhotos = PHAsset.fetchAssets(with: .image, options: fetchOptions)
             let total = allPhotos.count
             

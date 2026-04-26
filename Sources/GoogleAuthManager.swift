@@ -1,7 +1,7 @@
 import AppKit
 import CryptoKit
-import Darwin
 import Foundation
+import Network
 import Security
 
 final class GoogleAuthManager: ObservableObject {
@@ -102,7 +102,6 @@ final class GoogleAuthManager: ObservableObject {
                 return
             }
             if let token = json["access_token"] as? String, !token.isEmpty {
-                // Save refresh token if present
                 if let refreshToken = json["refresh_token"] as? String, !refreshToken.isEmpty {
                     KeychainTokenStore.saveRefreshToken(refreshToken)
                     #if DEBUG
@@ -122,19 +121,11 @@ final class GoogleAuthManager: ObservableObject {
         }.resume()
     }
     
-    /// Refresh the access token using stored refresh token — no user interaction needed
     static func refreshAccessToken(completion: @escaping (String?) -> Void) {
         guard let refreshToken = KeychainTokenStore.readRefreshToken(), !refreshToken.isEmpty else {
-            #if DEBUG
-            print("⚠️ Refresh token Keychain'de bulunamadı.")
-            #endif
             completion(nil)
             return
         }
-        
-        #if DEBUG
-        print("🔑 Refresh token bulundu, yenileme isteği gönderiliyor...")
-        #endif
         
         let tokenURL = URL(string: "https://oauth2.googleapis.com/token")!
         var request = URLRequest(url: tokenURL)
@@ -156,37 +147,21 @@ final class GoogleAuthManager: ObservableObject {
         request.httpBody = body
         
         URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                #if DEBUG
-                print("❌ Refresh ağ hatası: \(error.localizedDescription)")
-                #endif
+            if let _ = error {
                 completion(nil)
                 return
             }
             
-            let httpCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                #if DEBUG
-                print("❌ Refresh yanıtı parse edilemedi (HTTP \(httpCode))")
-                #endif
                 completion(nil)
                 return
             }
             
             if let newToken = json["access_token"] as? String, !newToken.isEmpty {
                 KeychainTokenStore.save(newToken)
-                #if DEBUG
-                print("✅ Token otomatik yenilendi! (HTTP \(httpCode))")
-                #endif
                 completion(newToken)
             } else {
-                #if DEBUG
-                let err = json["error"] as? String ?? "unknown"
-                let desc = json["error_description"] as? String ?? ""
-                print("❌ Refresh başarısız: \(err) — \(desc) (HTTP \(httpCode))")
-                #endif
                 completion(nil)
             }
         }.resume()
@@ -231,14 +206,13 @@ final class GoogleAuthManager: ObservableObject {
     }
 }
 
+// Madde 3: Modern Network framework (NWListener) tabanlı sunucu
 final class LocalHTTPServer {
     private let port: UInt16
     private let onReady: () -> Void
     private let onCode: (String) -> Void
     private let onBindFailed: () -> Void
-    private var isRunning = false
-    private var serverSocket: Int32 = -1
-    private var bindFailedReported = false
+    private var listener: NWListener?
 
     init(port: UInt16, onReady: @escaping () -> Void, onCode: @escaping (String) -> Void, onBindFailed: @escaping () -> Void) {
         self.port = port
@@ -248,103 +222,67 @@ final class LocalHTTPServer {
     }
 
     func start() {
-        isRunning = true
-        bindFailedReported = false
-        Thread.detachNewThread {
-            self.runServer()
+        do {
+            let parameters = NWParameters.tcp
+            listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+            
+            listener?.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .ready:
+                    DispatchQueue.main.async { self?.onReady() }
+                case .failed(let error):
+                    #if DEBUG
+                    print("NWListener failed: \(error)")
+                    #endif
+                    DispatchQueue.main.async { self?.onBindFailed() }
+                default:
+                    break
+                }
+            }
+            
+            listener?.newConnectionHandler = { [weak self] connection in
+                self?.handleConnection(connection)
+            }
+            
+            listener?.start(queue: .global())
+        } catch {
+            onBindFailed()
         }
     }
 
     func stop() {
-        isRunning = false
-        if serverSocket != -1 {
-            // Shutdown first to unblock accept(), then close
-            Darwin.shutdown(serverSocket, SHUT_RDWR)
-            close(serverSocket)
-            serverSocket = -1
-        }
+        listener?.cancel()
+        listener = nil
     }
 
-    private func reportBindFailedOnce() {
-        if bindFailedReported { return }
-        bindFailedReported = true
-        onBindFailed()
-    }
-
-    private func runServer() {
-        serverSocket = socket(AF_INET, SOCK_STREAM, 0)
-        guard serverSocket >= 0 else {
-            reportBindFailedOnce()
-            return
-        }
-
-        var opt: Int32 = 1
-        setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout.size(ofValue: opt)))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY
-
-        let bindResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-
-        if bindResult < 0 {
-            #if DEBUG
-            print("Sunucu başlatılamadı: Port \(port) kullanımda olabilir.")
-            #endif
-            reportBindFailedOnce()
-            if serverSocket != -1 {
-                close(serverSocket)
-                serverSocket = -1
-            }
-            return
-        }
-
-        listen(serverSocket, 1)
-        #if DEBUG
-        print("Yerel dogrulama sunucusu dinliyor (Port \(port))...")
-        #endif
-        DispatchQueue.main.async {
-            self.onReady()
-        }
-
-        while isRunning {
-            let clientSock = accept(serverSocket, nil, nil)
-            guard clientSock >= 0 else {
-                // accept failed — likely socket was shut down via stop()
-                break
-            }
-
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            let bytes = recv(clientSock, &buffer, buffer.count - 1, 0)
-
-            if bytes > 0 {
-                let request = String(bytes: buffer.prefix(bytes), encoding: .utf8) ?? ""
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: .global())
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+            if let data = data, let request = String(data: data, encoding: .utf8) {
                 if let range = request.range(of: "code="),
                    let endRange = request.range(of: " HTTP", range: range.upperBound..<request.endIndex) {
                     let fullCode = String(request[range.upperBound..<endRange.lowerBound])
                     let code = fullCode.components(separatedBy: "&").first ?? ""
-
+                    
                     let response = """
-                    HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n
+                    HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n
                     <html><body style='font-family:-apple-system,sans-serif;text-align:center;padding:50px;background:#f5f5f7'>
                     <h1 style='color:#007aff'>✅ İşlem Başarılı!</h1>
                     <p style='color:#1d1d1f'>Giriş yapıldı. SyncCloud uygulamasına dönebilirsiniz.</p>
                     <p style='color:#86868b;font-size:12px'>Bu pencereyi kapatabilirsiniz.</p>
                     </body></html>
                     """
-                    send(clientSock, response, response.utf8.count, 0)
-                    close(clientSock)
-                    onCode(code)
-                    break
+                    connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in
+                        connection.cancel()
+                    }))
+                    self?.onCode(code)
+                    self?.stop()
+                    return
                 }
             }
-            close(clientSock)
+            if isComplete || error != nil {
+                connection.cancel()
+            }
         }
-        stop()
     }
 }

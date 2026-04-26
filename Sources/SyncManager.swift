@@ -54,18 +54,26 @@ final class SyncManager: ObservableObject {
     }
     
     func requestPermission() {
-        PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+        PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
             DispatchQueue.main.async {
-                self.photoLibraryStatus = status
-                self.isPermissionGranted = (status == .authorized || status == .limited)
-                if self.isPermissionGranted { self.fetchPhotoCount() }
+                self?.photoLibraryStatus = status
+                self?.isPermissionGranted = (status == .authorized || status == .limited)
+                if self?.isPermissionGranted == true { self?.fetchPhotoCount() }
             }
         }
     }
     
+    private var sharedFetchOptions: PHFetchOptions {
+        let options = PHFetchOptions()
+        // Madde 4: Paylaşılan Kitaplık Desteği (Shared Library)
+        options.includeSharedLibraryContent = true
+        return options
+    }
+    
     private func fetchPhotoCount() {
-        let p = PHAsset.fetchAssets(with: .image, options: nil).count
-        let v = PHAsset.fetchAssets(with: .video, options: nil).count
+        let options = sharedFetchOptions
+        let p = PHAsset.fetchAssets(with: .image, options: options).count
+        let v = PHAsset.fetchAssets(with: .video, options: options).count
         DispatchQueue.main.async { self.totalPhotoCount = p + v }
     }
 
@@ -117,59 +125,66 @@ final class SyncManager: ObservableObject {
         syncQueue.async { [weak self] in
             guard let self = self else { return }
             self.syncShouldCancel = false
-            let opt = PHFetchOptions()
-            let assets = [PHAsset.fetchAssets(with: .image, options: opt), PHAsset.fetchAssets(with: .video, options: opt)]
+            
+            let options = self.sharedFetchOptions
+            let assets = [PHAsset.fetchAssets(with: .image, options: options), PHAsset.fetchAssets(with: .video, options: options)]
             var all: [PHAsset] = []
             for r in assets { for j in 0..<r.count { all.append(r.object(at: j)) } }
             if all.isEmpty { DispatchQueue.main.async { finished() }; return }
 
-            var consecutiveFailures = 0
-            for i in self.currentSyncIndex..<all.count {
-                autoreleasepool {
-                    if self.syncShouldCancel { return }
-                    self.currentSyncIndex = i
+            // Madde 1: Paralel Yükleme (Batching)
+            // Aynı anda 5 dosya yüklenecek şekilde TaskGroup kullanıyoruz
+            Task {
+                await withTaskGroup(of: Void.self) { group in
+                    var activeTasks = 0
+                    let maxConcurrentTasks = 5
                     
-                    for res in self.syncableResources(for: all[i]) {
+                    for i in self.currentSyncIndex..<all.count {
                         if self.syncShouldCancel { break }
-                        let sema = DispatchSemaphore(value: 0)
-                        self.exportResourceData(resource: res) { data, name, _ in
-                            guard let data = data else {
-                                consecutiveFailures += 1
-                                if consecutiveFailures > 5 {
-                                    self.addLog("🚨 Üst üste çok fazla hata! Senkronizasyon güvenlik için durduruldu.")
-                                    self.syncShouldCancel = true
-                                }
-                                Thread.sleep(forTimeInterval: 1.0)
-                                sema.signal()
-                                return
-                            }
-                            
-                            consecutiveFailures = 0
-                            self.googleDrive.uploadPhoto(name: name, data: data, accessToken: self.googleAccessToken) { ok, msg in
-                                if ok { self.addLog("✅ Yüklendi: \(name)") }
-                                else if (msg ?? "").contains("401") {
-                                    GoogleAuthManager.refreshAccessToken { nt in
-                                        if let t = nt {
-                                            self.googleAccessToken = t
-                                            self.googleDrive.uploadPhoto(name: name, data: data, accessToken: t) { r, _ in sema.signal() }
-                                        } else { 
-                                            self.addLog("🔑 Oturum yenilenemedi, lütfen tekrar giriş yapın.")
-                                            self.syncShouldCancel = true
-                                            sema.signal() 
+                        
+                        // Limit concurrency
+                        if activeTasks >= maxConcurrentTasks {
+                            await group.next()
+                            activeTasks -= 1
+                        }
+                        
+                        let asset = all[i]
+                        self.currentSyncIndex = i
+                        activeTasks += 1
+                        
+                        group.addTask {
+                            let resources = self.syncableResources(for: asset)
+                            for res in resources {
+                                if self.syncShouldCancel { break }
+                                let name = res.originalFilename
+                                
+                                await withCheckedContinuation { continuation in
+                                    self.exportResourceData(resource: res) { data, name, _ in
+                                        guard let data = data else {
+                                            continuation.resume()
+                                            return
+                                        }
+                                        
+                                        self.googleDrive.uploadPhoto(name: name, data: data, accessToken: self.googleAccessToken) { ok, msg in
+                                            if ok { self.addLog("✅ Yüklendi: \(name)") }
+                                            else { self.addLog("❌ Hata: \(name)") }
+                                            continuation.resume()
                                         }
                                     }
-                                    return
-                                } else { self.addLog("❌ Hata: \(name)"); if (msg ?? "").contains("403") { self.syncShouldCancel = true } }
-                                sema.signal()
+                                }
+                            }
+                            
+                            DispatchQueue.main.async {
+                                progressCallback(Double(i + 1) / Double(all.count))
                             }
                         }
-                        sema.wait()
-                        Thread.sleep(forTimeInterval: 0.05)
                     }
+                    
+                    await group.waitForAll()
                 }
-                DispatchQueue.main.async { progressCallback(Double(i+1)/Double(all.count)) }
+                
+                DispatchQueue.main.async { finished() }
             }
-            DispatchQueue.main.async { finished() }
         }
     }
 
@@ -260,7 +275,9 @@ final class SyncManager: ObservableObject {
                 sema.signal()
             }
             sema.wait()
-            let all = PHAsset.fetchAssets(with: .image, options: nil)
+            
+            let options = self.sharedFetchOptions
+            let all = PHAsset.fetchAssets(with: .image, options: options)
             var results: [DiffItem] = []
             var matched = Set<String>()
             for i in 0..<all.count {
