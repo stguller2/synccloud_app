@@ -1,0 +1,16 @@
+.build/
+dist/
+.swiftpm/
+
+# App bundle (contains real credentials in Info.plist)
+SyncCloud.app/
+
+# OAuth secrets (local only — never commit!)
+Secrets.plist
+
+# Entitlements (not needed in repo)
+SyncCloud.entitlements
+
+# macOS system files
+.DS_Store
+*.xcuserstate
